@@ -1,0 +1,1 @@
+cmd_/home/david/raspbian/Ejemplo3/pwm2.ko := /home/david/raspbian/tools/arm-bcm2708/arm-bcm2708-linux-gnueabi/bin/arm-bcm2708-linux-gnueabi-ld -EL -r  -T ./scripts/module-common.lds --build-id  -o /home/david/raspbian/Ejemplo3/pwm2.ko /home/david/raspbian/Ejemplo3/pwm2.o /home/david/raspbian/Ejemplo3/pwm2.mod.o
