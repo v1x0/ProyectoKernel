@@ -11,9 +11,14 @@
  */
 
 #define RPI_PWM_VERSION "1.0"
+
+// Nombre con el que se encuentra en sysfs (/sys/class/rpi-pwm)
 #define PWM_CLASS_NAME "rpi-pwm"
 
 #include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/interrupt.h>
+#include <linux/gpio.h>
 
 #include <asm/io.h>
 #include <linux/delay.h>
@@ -48,6 +53,99 @@
 
 #define strict_strtol   kstrtol
 
+/***************************************************************************/
+/* Interrupciones                                                          */
+/***************************************************************************/
+#define GPIO_ANY_GPIO 18
+
+//Texto que se mostrará en /proc/interrupt
+#define GPIO_ANY_GPIO_DESC "Interrupcion en el gpio 18 (pin 11)"
+
+// Quien utiliza la interrupcion
+#define GPIO_ANY_GPIO_DEVICE_DESC "Algun dispositivo"
+
+//Variables de bloque
+short int irq_any_gpio = 0;
+
+//estructura para los leds, posicion inicial
+//GPIO 27 (pin 11)
+static struct gpio leds[]={
+	{27, GPIOF_OUT_INIT_HIGH, "Led 1"}
+};
+
+//variable para almacenar si hay algun error
+short int reterror;
+//Variable para saber si ya se presiono el boton
+short int power=0;
+
+
+void rpi_pwm_cleanup(void);
+int rpi_pwm_init(void);
+
+
+/* Manejador de interrupcion / se lanza cuando ocurre la interrupcion */
+static irqreturn_t r_irq_handler(int irq, void *dev_id, struct pt_regs *regs){
+
+	unsigned long flags;
+
+	//deshabilitamos las interrupciones
+	local_irq_save(flags);
+	
+	if(power){
+		gpio_set_value(leds[0].gpio,1);
+		rpi_pwm_cleanup();
+		power=0;
+	}else{
+		gpio_set_value(leds[0].gpio,0);
+		rpi_pwm_init();
+		power=1;
+	}
+	
+	//Restauramos las interrupciones
+	local_irq_restore(flags);
+
+	return IRQ_HANDLED;
+}
+
+//Funcion para configurar interrupciones
+void r_int_config(void){
+	if(gpio_request(GPIO_ANY_GPIO, GPIO_ANY_GPIO_DESC)){	
+		printk("Error en request: %s\n",GPIO_ANY_GPIO_DESC);
+		return;
+	}
+
+	if((irq_any_gpio=gpio_to_irq(GPIO_ANY_GPIO))<0){
+		printk("error al mapear la interrupcion %s\n",GPIO_ANY_GPIO_DESC);
+		return;
+	}
+
+	printk(KERN_NOTICE "Interrupcion mapeada en %d\n", irq_any_gpio);
+
+	if(request_irq(irq_any_gpio,(irq_handler_t)r_irq_handler,IRQF_TRIGGER_FALLING,GPIO_ANY_GPIO_DESC,GPIO_ANY_GPIO_DEVICE_DESC)){
+		printk("Error en el request irq\n");
+		return;
+	}
+
+	reterror=gpio_request_array(leds,ARRAY_SIZE(leds));
+
+	if(reterror){
+		printk(KERN_ERR "Request GPIO ocupado%d\n",reterror);
+	}
+	return;
+}
+
+//funcion que lanza las interrupciones
+void r_int_release(void){
+	free_irq(irq_any_gpio,GPIO_ANY_GPIO_DEVICE_DESC);
+	gpio_free(GPIO_ANY_GPIO);
+	return;
+}
+
+void r_cleanup(void){
+	r_int_release();
+	return;
+}
+
 static DEFINE_MUTEX(sysfs_lock);
 static void __iomem *pwm_reg;
 static void __iomem *gpio_reg;
@@ -65,6 +163,7 @@ static char *device_mode_str[] = {
 	"audio",
 };
 
+//estructura para manejar el pwm
 struct rpi_pwm {
 	u32 duty;
 	u32 frequency;
@@ -86,7 +185,13 @@ struct rpi_pwm {
 static struct rpi_pwm pwms[] = {
 	{
 		.immediate	= 1,
-		.duty		= 100,
+		.duty		= 60,
+		.servo_max	= 32,
+		.mcf		= 16000,  /* 16 kHz is a good common number */
+	},
+	{
+		.immediate	= 1,
+		.duty		= 60,
 		.servo_max	= 32,
 		.mcf		= 16000,  /* 16 kHz is a good common number */
 	},
@@ -98,7 +203,6 @@ static int rpi_pwm_set_clk(struct rpi_pwm *dev, u32 mcf) {
 	/* Stop clock and waiting for busy flag doesn't work, so kill clock */
 	__raw_writel(0x5A000000 | (1 << 5), PWMCLK_CNTL);
 	udelay(10);  
-
 	if (!dev->mcf) {
 		dev_err(dev->dev, "no MCF specified\n");
 		return -EINVAL;
@@ -235,18 +339,28 @@ static int rpi_pwm_deactivate(struct rpi_pwm *dev) {
 }
 
 
+/*********************************************************************************/
+/* https://www.kernel.org/doc/Documentation/filesystems/sysfs.txt                */
+/*********************************************************************************/
 
+/*********************************************************************************/
+/* active_show Funciona para la lectura y debe llenar toda la lectura intermedia */
+/*********************************************************************************/
 static ssize_t active_show(struct device *d,
 		struct device_attribute *attr, char *buf)
 {
 	ssize_t ret;
+	//Obtenemos el valor que tiene en el archivo "active" de sysfs
 	struct rpi_pwm *dev = dev_get_drvdata(d);
 	mutex_lock(&sysfs_lock);
-	ret = sprintf(buf, "%d\n", !!dev->active);
+		ret = sprintf(buf, "%d\n", !!dev->active);
 	mutex_unlock(&sysfs_lock);
 	return ret;
 }
 
+/***********************************************************************************/
+/* active_show Funciona para la escritura y debe llenar toda la lectura intermedia */
+/***********************************************************************************/
 static ssize_t active_store(struct device *d,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
@@ -255,15 +369,15 @@ static ssize_t active_store(struct device *d,
 	struct rpi_pwm *dev = dev_get_drvdata(d);
 
 	mutex_lock(&sysfs_lock);
-	ret = strict_strtol(buf, 0, &new_active);
-	if (ret == 0) {
-		if (new_active)
-			ret = rpi_pwm_activate(dev);
+		ret = strict_strtol(buf, 0, &new_active);
+		if (ret == 0) {
+			if (new_active)
+				ret = rpi_pwm_activate(dev);
+			else
+				ret = rpi_pwm_deactivate(dev);
+		}
 		else
-			ret = rpi_pwm_deactivate(dev);
-	}
-	else
-		ret = -EINVAL;
+			ret = -EINVAL;
 	mutex_unlock(&sysfs_lock);
 	return ret?ret:count;
 }
@@ -601,13 +715,14 @@ static struct class pwm_class = {
 };
 
 
-int __init rpi_pwm_init(void)
+int rpi_pwm_init(void)
 {
 	int ret = 0;
 	int pwm = 0;
 
-	pr_info("Adafruit Industries' Raspberry Pi PWM driver v%s\n", RPI_PWM_VERSION);
+//	pr_info("Adafruit Industries' Raspberry Pi PWM driver v%s\n", RPI_PWM_VERSION);
 
+	//Registramos el dispositivo en sysfs
 	ret = class_register(&pwm_class);
 	if (ret < 0) {
 		pr_err("%s: Unable to register class\n", pwm_class.name);
@@ -617,9 +732,18 @@ int __init rpi_pwm_init(void)
 
 	/* Create devices for each PWM present */
 	for (pwm=0; pwm<ARRAY_SIZE(pwms); pwm++) {
+		//identificador del pwm
 		pwms[pwm].id = pwm;
+
+		/**********************************************************************/
+		/* struct device * device_create(apuntador de la estructura clase que */
+		/* será registrada, apuntador al padre del dispositivo, identificador */
+		/* del dispositivo (en número) En este caso se usa MKDEV(mayor,menor) */
+		/* Datos que se agregan al dispositivo, Cadena para identificacion    */
+		/* dispositivo (/sys/class/rpi_pwm/pwm%u)) */
+		/**********************************************************************/
 		pwms[pwm].dev = device_create(&pwm_class, &platform_bus,
-				MKDEV(0, 0), &pwms[pwm], "pwm%u", pwm);
+				MKDEV(0, 1), &pwms[pwm], "pwm%u", pwm);
 		if (IS_ERR(pwms[pwm].dev)) {
 			pr_err("%s: device_create failed\n", pwm_class.name);
 			ret = PTR_ERR(pwms[pwm].dev);
@@ -629,6 +753,7 @@ int __init rpi_pwm_init(void)
 
 	/* Create sysfs entries for each PWM */
 	for (pwm=0; pwm<ARRAY_SIZE(pwms); pwm++) {
+		/* Agregamos los pwms a una entrada en sysfs */
 		ret = sysfs_create_group(&pwms[pwm].dev->kobj,
 						&rpi_pwm_attribute_group);
 		if (ret < 0) {
@@ -660,7 +785,7 @@ out0:
 	return ret;
 }
 
-void __exit rpi_pwm_cleanup(void)
+void rpi_pwm_cleanup(void)
 {
 	int pwm;
 	for (pwm=0; pwm<ARRAY_SIZE(pwms); pwm++) {
@@ -680,8 +805,8 @@ void __exit rpi_pwm_cleanup(void)
 	class_unregister(&pwm_class);
 }
 
-module_init(rpi_pwm_init);
-module_exit(rpi_pwm_cleanup);
+module_init(r_int_config);
+module_exit(r_cleanup);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sean Cross <xobs@xoblo.gs> for Adafruit Industries <www.adafruit.com>");
 MODULE_ALIAS("platform:bcm2708_pwm");
