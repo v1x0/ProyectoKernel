@@ -1,0 +1,12 @@
+#!/bin/bash
+/bin/echo 10 > /sys/class/pwm-embedded/pwm0/frequency
+sleep 3
+/bin/echo 20 > /sys/class/pwm-embedded/pwm0/frequency
+sleep 3
+/bin/echo 30 > /sys/class/pwm-embedded/pwm0/frequency
+sleep 3
+/bin/echo 40 > /sys/class/pwm-embedded/pwm0/frequency
+sleep 3
+/bin/echo 50 > /sys/class/pwm-embedded/pwm0/frequency
+sleep 3
+/bin/echo 10 > /sys/class/pwm-embedded/pwm0/frequency
